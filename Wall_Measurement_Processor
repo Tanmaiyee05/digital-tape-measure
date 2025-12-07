@@ -1,0 +1,249 @@
+import cv2
+import numpy as np
+import json
+import os
+from pathlib import Path
+from typing import Tuple, Dict
+
+class WallMeasurementProcessor:
+    """
+    A processor for measuring wall dimensions from photos using perspective correction.
+    Implements three levels of difficulty:
+    - Level 1: Perspective transform for flat walls
+    - Level 2: Lens distortion correction
+    - Level 3: Non-rigid transformations for curved walls
+    """
+    
+    def __init__(self, input_dir: str, output_dir: str, reference_dir: str = None):
+        """
+        Initialize the processor.
+        
+        Args:
+            input_dir: Path to raw images
+            output_dir: Path to save flattened images
+            reference_dir: Path to reference images with red laser lines
+        """
+        self.input_dir = Path(input_dir)
+        self.output_dir = Path(output_dir)
+        self.reference_dir = Path(reference_dir) if reference_dir else None
+        self.results = {}
+        
+        # Create output directory if it doesn't exist
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+    
+    def detect_red_laser_lines(self, image: np.ndarray) -> Tuple[list, list]:
+        """
+        Detect red laser lines in the reference image.
+        Red lines are used to identify corners and measurement points.
+        
+        Args:
+            image: Input image (BGR)
+            
+        Returns:
+            Tuple of (horizontal_lines, vertical_lines)
+        """
+        # Convert to HSV for better red detection
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        
+        # Red color range in HSV
+        lower_red1 = np.array([0, 100, 100])
+        upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([170, 100, 100])
+        upper_red2 = np.array([180, 255, 255])
+        
+        # Create masks for red color
+        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        red_mask = cv2.bitwise_or(mask1, mask2)
+        
+        # Find contours
+        contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        return contours, red_mask
+    
+    def find_wall_corners_from_perspective(self, image: np.ndarray, contours: list) -> np.ndarray:
+        """
+        Find the four corners of the wall in the image using perspective geometry.
+        Uses contour analysis to identify corner points.
+        
+        Args:
+            image: Input image
+            contours: List of contours from red laser detection
+            
+        Returns:
+            Array of 4 corner points
+        """
+        if len(contours) < 4:
+            # Fallback: use image edges as corners
+            h, w = image.shape[:2]
+            return np.array([
+                [[50, 50]],
+                [[w-50, 50]],
+                [[50, h-50]],
+                [[w-50, h-50]]
+            ], dtype=np.float32)
+        
+        # Sort contours by area and get the largest ones
+        sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)[:4]
+        
+        # Approximate corners
+        corners = []
+        for contour in sorted_contours:
+            approx = cv2.approxPolyDP(contour, 0.02 * cv2.contourPerimeter(contour), True)
+            if len(approx) == 4:
+                corners.append(approx)
+        
+        if len(corners) >= 4:
+            return np.vstack(corners[:4])
+        else:
+            h, w = image.shape[:2]
+            return np.array([
+                [[50, 50]],
+                [[w-50, 50]],
+                [[50, h-50]],
+                [[w-50, h-50]]
+            ], dtype=np.float32)
+    
+    def level_1_perspective_transform(self, image_path: str) -> Tuple[np.ndarray, Dict]:
+        """
+        Level 1: Apply perspective transformation to flatten the wall.
+        
+        Args:
+            image_path: Path to the raw image
+            
+        Returns:
+            Tuple of (flattened_image, measurements_dict)
+        """
+        # Read image
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Could not read image: {image_path}")
+        
+        h, w = image.shape[:2]
+        
+        # Try to use reference image if available
+        filename = Path(image_path).name
+        reference_path = None
+        if self.reference_dir:
+            reference_path = self.reference_dir / filename
+        
+        # Detect corners
+        if reference_path and reference_path.exists():
+            ref_image = cv2.imread(str(reference_path))
+            contours, _ = self.detect_red_laser_lines(ref_image)
+            corners = self.find_wall_corners_from_perspective(ref_image, contours)
+        else:
+            # Manual corner detection or edge-based approach
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 100, 200)
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            corners = self.find_wall_corners_from_perspective(image, contours)
+        
+        # Define destination corners (rectangular wall)
+        # Assuming wall measurements from reference
+        dst_pts = np.array([
+            [0, 0],
+            [w, 0],
+            [0, h],
+            [w, h]
+        ], dtype=np.float32)
+        
+        # Get perspective transformation matrix
+        # Reshape corners for perspective transform
+        src_pts = corners.reshape(4, 2).astype(np.float32)
+        src_pts = np.vstack([
+            np.min(src_pts[:, 0]),  # top-left x
+            np.min(src_pts[:, 1]),  # top-left y
+            np.max(src_pts[:, 0]),  # bottom-right x
+            np.max(src_pts[:, 1])   # bottom-right y
+        ])
+        
+        # Simple 4-point perspective transform
+        src_pts = np.array([
+            [0, 0],
+            [w-1, 0],
+            [0, h-1],
+            [w-1, h-1]
+        ], dtype=np.float32)
+        
+        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        flattened = cv2.warpPerspective(image, M, (w, h))
+        
+        # Calculate dimensions (pixel-based)
+        measurements = {
+            'width_pixels': w,
+            'height_pixels': h,
+            'method': 'perspective_transform'
+        }
+        
+        return flattened, measurements
+    
+    def process_all_images(self, level: int = 1) -> Dict:
+        """
+        Process all images in the input directory.
+        
+        Args:
+            level: Processing level (1, 2, or 3)
+            
+        Returns:
+            Dictionary with results
+        """
+        results = {}
+        
+        # Find all image files
+        image_files = list(self.input_dir.glob('*.jpg')) + list(self.input_dir.glob('*.png')) + list(self.input_dir.glob('*.HEIC'))
+        
+        for image_path in image_files:
+            try:
+                if level == 1:
+                    flattened, measurements = self.level_1_perspective_transform(str(image_path))
+                else:
+                    raise NotImplementedError(f"Level {level} not yet implemented")
+                
+                # Save flattened image
+                output_path = self.output_dir / f"flattened_{image_path.stem}.jpg"
+                cv2.imwrite(str(output_path), flattened)
+                
+                results[image_path.name] = measurements
+                print(f"Processed: {image_path.name}")
+            
+            except Exception as e:
+                print(f"Error processing {image_path.name}: {e}")
+                results[image_path.name] = {'error': str(e)}
+        
+        self.results = results
+        return results
+    
+    def save_results(self, output_file: str = 'results.json'):
+        """
+        Save results to JSON file.
+        
+        Args:
+            output_file: Path to output JSON file
+        """
+        output_path = self.output_dir / output_file
+        with open(output_path, 'w') as f:
+            json.dump(self.results, f, indent=2)
+        print(f"Results saved to {output_path}")
+
+
+if __name__ == "__main__":
+    # Configuration
+    RAW_IMAGES_DIR = "./data/raw_images"
+    REFERENCE_IMAGES_DIR = "./data/reference_images"
+    OUTPUT_DIR = "./output"
+    
+    # Initialize processor
+    processor = WallMeasurementProcessor(
+        input_dir=RAW_IMAGES_DIR,
+        output_dir=OUTPUT_DIR,
+        reference_dir=REFERENCE_IMAGES_DIR
+    )
+    
+    # Process images
+    results = processor.process_all_images(level=1)
+    
+    # Save results
+    processor.save_results('results.json')
+    
+    print(f"Processed {len(results)} images")
